@@ -3296,3 +3296,281 @@ t.test('excessively deep subfolder nesting', async t => {
     check(t, 64)
   })
 })
+
+t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
+  const dir = t.testdir()
+  const out = path.resolve(dir, 'out_repro')
+  const secretFile = path.resolve(dir, 'secret.txt')
+  const targetSym = '/some/absolute/path'
+
+  // Setup directory structure
+  mkdirp.sync(out)
+  fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+
+  // Create exploit tar with absolute linkpaths
+  const exploitTar = Buffer.alloc(512 + 512 + 1024)
+
+  new Header({
+    path: 'exploit_hard',
+    type: 'Link',
+    size: 0,
+    linkpath: secretFile,
+  }).encode(exploitTar, 0)
+
+  new Header({
+    path: 'exploit_sym',
+    type: 'SymbolicLink',
+    size: 0,
+    linkpath: targetSym,
+  }).encode(exploitTar, 512)
+
+  // CVE-2026-31802: Windows drive-relative path with multiple dotdot that escapes
+  const escapeExploitTar = Buffer.alloc(512 + 1024)
+  new Header({
+    path: 'a/winrootdotsescapelink',
+    type: 'SymbolicLink',
+    linkpath: 'c:..\\..\\..\\..\\foo\\bar',
+  }).encode(escapeExploitTar, 0)
+
+  t.test('async', t => {
+    const asyncOut = path.resolve(out, 'async')
+    mkdirp.sync(asyncOut)
+    new Unpack({
+      cwd: asyncOut,
+      preservePaths: false,
+    }).on('end', () => {
+      // Verify exploit_hard: if it exists, writing to it should not overwrite secret.txt
+      const hardPath = path.resolve(asyncOut, 'exploit_hard')
+      try {
+        fs.writeFileSync(hardPath, 'OVERWRITTEN')
+      } catch (er) {}
+      t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+        'hardlink should not point to secret file')
+
+      // Verify symbolic link doesn't point to absolute path
+      const symPath = path.resolve(asyncOut, 'exploit_sym')
+      try {
+        t.not(fs.readlinkSync(symPath), targetSym,
+          'symlink should not point to absolute path')
+      } catch (er) {
+        t.pass('symlink was correctly skipped or sanitized')
+      }
+      t.end()
+    }).end(exploitTar)
+  })
+
+  // CVE-2026-31802: escaping symlink after root strip should be rejected
+  t.test('async escape', t => {
+    const escapeOut = path.resolve(out, 'async_escape')
+    mkdirp.sync(escapeOut)
+    new Unpack({
+      cwd: escapeOut,
+      preservePaths: false,
+    }).on('end', () => {
+      t.throws(
+        () => fs.lstatSync(path.resolve(escapeOut, 'a/winrootdotsescapelink')),
+        'escaping symlink is not created',
+      )
+      t.end()
+    }).end(escapeExploitTar)
+  })
+
+  t.test('sync', t => {
+    const syncOut = path.resolve(out, 'sync')
+    mkdirp.sync(syncOut)
+    new UnpackSync({
+      cwd: syncOut,
+      preservePaths: false,
+    }).end(exploitTar)
+
+    // Verify exploit_hard: if it exists, writing to it should not overwrite secret.txt
+    const hardPath = path.resolve(syncOut, 'exploit_hard')
+    try {
+      fs.writeFileSync(hardPath, 'OVERWRITTEN')
+    } catch (er) {}
+    t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+      'hardlink should not point to secret file')
+
+    // Verify symbolic link doesn't point to absolute path
+    const symPath = path.resolve(syncOut, 'exploit_sym')
+    try {
+      t.not(fs.readlinkSync(symPath), targetSym,
+        'symlink should not point to absolute path')
+    } catch (er) {
+      t.pass('symlink was correctly skipped or sanitized')
+    }
+    t.end()
+  })
+
+  // CVE-2026-31802: escaping symlink after root strip should be rejected
+  t.test('sync escape', t => {
+    const escapeOut = path.resolve(out, 'sync_escape')
+    mkdirp.sync(escapeOut)
+    new UnpackSync({
+      cwd: escapeOut,
+      preservePaths: false,
+    }).end(escapeExploitTar)
+    t.throws(
+      () => fs.lstatSync(path.resolve(escapeOut, 'a/winrootdotsescapelink')),
+      'escaping symlink is not created',
+    )
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('GHSA-34x7-hfp2-rc4v hardlink .. escape', t => {
+  // Hardlinks with '..' in linkpath should be rejected
+  // Symlinks with '..' are allowed (for valid relative symlinks)
+  const dir = t.testdir()
+  const out = path.resolve(dir, 'out')
+  const secretFile = path.resolve(dir, 'secret.txt')
+
+  mkdirp.sync(out)
+  fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+
+  // Create tar with hardlink that tries to escape via ..
+  const data = makeTar([
+    {
+      path: 'exploit_hard',
+      type: 'Link',
+      linkpath: '../secret.txt',
+    },
+    {
+      path: 'sub/',
+      type: 'Directory',
+    },
+    {
+      path: 'sub/nested_hard',
+      type: 'Link',
+      linkpath: '../../secret.txt',
+    },
+    {
+      path: 'valid_sym',
+      type: 'SymbolicLink',
+      linkpath: '../secret.txt',
+    },
+    '',
+    ''
+  ])
+
+  t.test('async', t => {
+    const warnings = []
+    const asyncOut = path.resolve(out, 'async')
+    mkdirp.sync(asyncOut)
+    new Unpack({
+      cwd: asyncOut,
+      onwarn: (c, w, d) => warnings.push([w, d])
+    }).on('end', () => {
+      // Should have warned about hardlinks with ..
+      t.ok(warnings.some(w => w[0] === "linkpath contains '..'"),
+        'warned about hardlink with ..')
+
+      // Hardlinks should not have been created
+      t.throws(() => fs.lstatSync(path.resolve(asyncOut, 'exploit_hard')))
+      t.throws(() => fs.lstatSync(path.resolve(asyncOut, 'sub/nested_hard')))
+
+      // Secret file should be untouched
+      t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA')
+
+      // Symlink with .. should be allowed (relative symlinks are valid)
+      const symPath = path.resolve(asyncOut, 'valid_sym')
+      t.ok(fs.lstatSync(symPath).isSymbolicLink(), 'symlink created')
+      t.equal(fs.readlinkSync(symPath), '../secret.txt')
+
+      t.end()
+    }).end(data)
+  })
+
+  t.test('sync', t => {
+    const warnings = []
+    const syncOut = path.resolve(out, 'sync')
+    mkdirp.sync(syncOut)
+    new UnpackSync({
+      cwd: syncOut,
+      onwarn: (c, w, d) => warnings.push([w, d])
+    }).end(data)
+
+    // Should have warned about hardlinks with ..
+    t.ok(warnings.some(w => w[0] === "linkpath contains '..'"),
+      'warned about hardlink with ..')
+
+    // Hardlinks should not have been created
+    t.throws(() => fs.lstatSync(path.resolve(syncOut, 'exploit_hard')))
+    t.throws(() => fs.lstatSync(path.resolve(syncOut, 'sub/nested_hard')))
+
+    // Secret file should be untouched
+    t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA')
+
+    // Symlink with .. should be allowed (relative symlinks are valid)
+    const symPath = path.resolve(syncOut, 'valid_sym')
+    t.ok(fs.lstatSync(symPath).isSymbolicLink(), 'symlink created')
+    t.equal(fs.readlinkSync(symPath), '../secret.txt')
+
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('no linking through a symlink', t => {
+  const types = ['Link', 'SymbolicLink']
+  for (const type of types) {
+    t.test(type, t => {
+      const exploit = makeTar([
+        {
+          type: 'SymbolicLink',
+          path: 'a/b/up',
+          linkpath: '../..',
+          mode: 0o755,
+        },
+        {
+          type: 'SymbolicLink',
+          path: 'a/b/escape',
+          linkpath: 'up/..',
+          mode: 0o755,
+        },
+        {
+          type,
+          path: 'exploit',
+          linkpath: 'a/b/escape/exploited-file',
+          mode: 0o755,
+        },
+        '',
+        '',
+      ])
+      const setup = t =>  t.testdir({
+        x: {},
+        'exploited-file': 'original content',
+      })
+      const check = t => {
+        fs.writeFileSync(t.testdirName + '/x/exploit', 'pwned')
+        t.equal(
+          fs.readFileSync(t.testdirName + '/exploited-file', 'utf8'),
+          'original content',
+        )
+      }
+      t.test('sync', t => {
+        const cwd = setup(t)
+        t.throws(() => {
+          new UnpackSync({ cwd, strict: true }).end(exploit)
+        })
+        check(t)
+        t.end()
+      })
+      t.test('async', async t => {
+        const cwd = setup(t)
+        await t.rejects(new Promise((res, rej) => {
+          new Unpack({ cwd, strict: true })
+            .on('finish', res)
+            .on('error', rej)
+            .end(exploit)
+        }))
+        check(t)
+      })
+      t.end()
+    })
+  }
+  t.end()
+})

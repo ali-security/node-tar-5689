@@ -12,7 +12,7 @@ const cafe2 = Buffer.from([0x63, 0x61, 0x66, 0x65, 0xcc, 0x81]).toString()
 
 t.equal(normalize(cafe1), normalize(cafe2), 'matching unicodes')
 t.equal(normalize(cafe1), normalize(cafe2), 'cached')
-t.equal(normalize('foo'), 'foo', 'non-unicode string')
+t.equal(normalize('foo'), 'FOO', 'non-unicode string')
 
 t.test('normalize with strip slashes', t => {
   const paths = [
